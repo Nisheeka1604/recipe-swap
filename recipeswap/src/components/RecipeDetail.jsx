@@ -1,8 +1,55 @@
-import { useState, useEffect } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { FaHeart, FaRegHeart, FaBookmark, FaRegBookmark, FaClock, FaUtensils, FaUser, FaComment } from 'react-icons/fa';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useParams, Link, useNavigate } from 'react-router-dom';
+import { 
+  FaHeart, FaRegHeart, FaBookmark, FaRegBookmark, 
+  FaClock, FaUtensils, FaUser, FaComment, FaStar, 
+  FaRegStar, FaEllipsisV, FaEdit, FaTrash, FaReply
+} from 'react-icons/fa';
 import { supabase } from '../lib/supabase';
 import { formatDistanceToNow } from 'date-fns';
+import RatingStars from './RatingStars';
+import Comment from './Comment';
+
+// Types
+type Media = {
+  id: string;
+  url: string;
+  media_type: 'image' | 'video';
+  position: number;
+};
+
+type CommentType = {
+  id: string;
+  content: string;
+  created_at: string;
+  user_id: string;
+  user?: {
+    id: string;
+    username: string;
+    avatar_url?: string;
+  };
+  like_count?: number;
+  replies?: CommentType[];
+};
+
+type Recipe = {
+  id: string;
+  title: string;
+  description: string;
+  prep_time: number;
+  cook_time: number;
+  servings: number;
+  user_id: string;
+  created_at: string;
+  author?: {
+    id: string;
+    username: string;
+    avatar_url?: string;
+  };
+  ratings?: { rating: number }[];
+  ingredients?: string[];
+  instructions?: string[];
+};
 
 const RecipeDetail = () => {
   const { id } = useParams();
@@ -16,64 +63,168 @@ const RecipeDetail = () => {
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState(null);
+  const [averageRating, setAverageRating] = useState(0);
+  const [userRating, setUserRating] = useState(0);
+  const [showCommentForm, setShowCommentForm] = useState(false);
+  const [commentContent, setCommentContent] = useState('');
+  const [replyingTo, setReplyingTo] = useState(null);
+  const commentInputRef = useRef(null);
+  const navigate = useNavigate();
 
-  useEffect(() => {
-    fetchRecipe();
-    fetchMedia();
-    checkIfLiked();
-    checkIfSaved();
-    fetchComments();
-    getCurrentUser();
-    
-    // Set up real-time subscription for comments
-    const commentsSubscription = supabase
-      .channel('comments')
-      .on('postgres_changes', 
-        { 
-          event: '*', 
-          schema: 'public', 
-          table: 'comments',
-          filter: `recipe_id=eq.${id}`
-        }, 
-        (payload) => {
-          if (payload.eventType === 'INSERT') {
-            setComments(prev => [payload.new, ...prev]);
-          } else if (payload.eventType === 'DELETE') {
-            setComments(prev => prev.filter(c => c.id !== payload.old.id));
-          } else if (payload.eventType === 'UPDATE') {
-            setComments(prev => 
-              prev.map(c => c.id === payload.new.id ? payload.new : c)
-            );
-          }
+  const checkIfLiked = async () => {
+    const { data: { user: authUser } } = await supabase.auth.getUser();
+    if (!authUser) return;
+
+    const { data, error } = await supabase
+      .from('likes')
+      .select('id')
+      .eq('user_id', authUser.id)
+      .eq('recipe_id', id)
+      .single();
+
+    if (!error && data) {
+      setIsLiked(true);
+    }
+  };
+
+  const checkIfSaved = async () => {
+    const { data: { user: authUser } } = await supabase.auth.getUser();
+    if (!authUser) return;
+
+    const { data, error } = await supabase
+      .from('saved_recipes')
+      .select('id')
+      .eq('user_id', authUser.id)
+      .eq('recipe_id', id)
+      .single();
+
+    if (!error && data) {
+      setIsSaved(true);
+    }
+  };
+
+  const handleLike = async () => {
+    if (!user) {
+      navigate('/login', { state: { from: `/recipe/${id}` } });
+      return;
+    }
+
+    try {
+      if (isLiked) {
+        // Unlike
+        const { error } = await supabase
+          .from('likes')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('recipe_id', id);
+
+        if (error) throw error;
+
+        setLikeCount(prev => Math.max(0, prev - 1));
+        setIsLiked(false);
+      } else {
+        // Like
+        const { error } = await supabase
+          .from('likes')
+          .insert([{ user_id: user.id, recipe_id: id }]);
+
+        if (error) throw error;
+
+        setLikeCount(prev => prev + 1);
+        setIsLiked(true);
+        
+        // Create notification for recipe author if not the current user
+        if (recipe && recipe.user_id !== user.id) {
+          await supabase.from('notifications').insert([{
+            user_id: recipe.user_id,
+            from_user_id: user.id,
+            type: 'like',
+            reference_id: id
+          }]);
         }
-      )
-      .subscribe();
+      }
+    } catch (error) {
+      console.error('Error toggling like:', error);
+    }
+  };
 
-    return () => {
-      supabase.removeChannel(commentsSubscription);
-    };
-  }, [id]);
+  const handleSave = async () => {
+    if (!user) {
+      navigate('/login', { state: { from: `/recipe/${id}` } });
+      return;
+    }
 
-  const getCurrentUser = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    setUser(user);
+    try {
+      if (isSaved) {
+        // Unsave
+        const { error } = await supabase
+          .from('saved_recipes')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('recipe_id', id);
+
+        if (error) throw error;
+      } else {
+        // Save
+        const { error } = await supabase
+          .from('saved_recipes')
+          .insert([{ user_id: user.id, recipe_id: id }]);
+
+        if (error) throw error;
+      }
+
+      setIsSaved(!isSaved);
+    } catch (error) {
+      console.error('Error toggling save:', error);
+    }
   };
 
   const fetchRecipe = async () => {
     try {
-      const { data, error } = await supabase
+      setLoading(true);
+      
+      // Get recipe with author details and average rating
+      const { data: recipeData, error: recipeError } = await supabase
         .from('recipes')
         .select(`
           *,
-          profiles (id, username, avatar_url)
+          author:profiles!recipes_user_id_fkey(
+            id,
+            username,
+            avatar_url
+          ),
+          ratings:ratings(
+            rating
+          )
         `)
         .eq('id', id)
         .single();
 
-      if (error) throw error;
+      if (recipeError) throw recipeError;
       
-      setRecipe(data);
-      setLikeCount(data.like_count || 0);
+      // Calculate average rating
+      if (recipeData.ratings && recipeData.ratings.length > 0) {
+        const total = recipeData.ratings.reduce((sum, r) => sum + r.rating, 0);
+        const avg = total / recipeData.ratings.length;
+        setAverageRating(parseFloat(avg.toFixed(1)));
+      }
+      
+      setRecipe(recipeData);
+      
+      // Check if user has rated this recipe
+      if (user) {
+        const { data: userRatingData, error: ratingError } = await supabase
+          .from('ratings')
+          .select('rating')
+          .eq('recipe_id', id)
+          .eq('user_id', user.id)
+          .single();
+          
+        if (userRatingData) {
+          setUserRating(userRatingData.rating);
+        }
+      }
+      
     } catch (error) {
       console.error('Error fetching recipe:', error);
     } finally {
@@ -93,126 +244,379 @@ const RecipeDetail = () => {
     }
   };
 
-  const checkIfLiked = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-
-    const { data, error } = await supabase
-      .from('likes')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('recipe_id', id)
-      .single();
-
-    if (!error && data) {
-      setIsLiked(true);
-    }
-  };
-
-  const checkIfSaved = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-
-    const { data, error } = await supabase
-      .from('saved_recipes')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('recipe_id', id)
-      .single();
-
-    if (!error && data) {
-      setIsSaved(true);
-    }
-  };
-
   const fetchComments = async () => {
-    const { data, error } = await supabase
-      .from('comments')
-      .select(`
-        *,
-        profiles (id, username, avatar_url)
-      `)
-      .eq('recipe_id', id)
-      .order('created_at', { ascending: false });
+    try {
+      const { data, error } = await supabase
+        .from('comments')
+        .select(`
+          *,
+          user:profiles!comments_user_id_fkey(
+            id,
+            username,
+            avatar_url
+          ),
+          likes:comment_likes(count)
+        `)
+        .eq('recipe_id', id)
+        .is('parent_id', null) // Only top-level comments
+        .order('created_at', { ascending: false });
 
-    if (!error && data) {
-      setComments(data);
+      if (error) throw error;
+
+      // For each comment, fetch its replies
+      const commentsWithReplies = await Promise.all(
+        (data || []).map(async (comment) => {
+          const { data: replies, error: repliesError } = await supabase
+            .from('comments')
+            .select(`
+              *,
+              user:profiles!comments_user_id_fkey(
+                id,
+                username,
+                avatar_url
+              ),
+              likes:comment_likes(count)
+            `)
+            .eq('parent_id', comment.id)
+            .order('created_at', { ascending: true });
+
+          if (repliesError) throw repliesError;
+
+          return {
+            ...comment,
+            replies: replies || [],
+            like_count: comment.likes?.[0]?.count || 0
+          };
+        })
+      );
+
+      setComments(commentsWithReplies);
+    } catch (error) {
+      console.error('Error fetching comments:', error);
     }
   };
 
-  const handleLike = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
+  const handleRatingChange = async (rating) => {
+    if (!user) {
+      navigate('/login', { state: { from: `/recipe/${id}` } });
+      return;
+    }
 
-    if (isLiked) {
-      // Unlike
-      const { error } = await supabase
-        .from('likes')
-        .delete()
-        .eq('user_id', user.id)
-        .eq('recipe_id', id);
+    try {
+      const { error } = await supabase.rpc('upsert_rating', {
+        p_recipe_id: id,
+        p_user_id: user.id,
+        p_rating: rating
+      });
 
-      if (!error) {
-        setIsLiked(false);
-        setLikeCount(prev => Math.max(0, prev - 1));
+      if (error) throw error;
+
+      // Update local state
+      setUserRating(rating);
+      
+      // Re-fetch recipe to update average rating
+      fetchRecipe();
+      
+      // Create notification for recipe author if not the current user
+      if (recipe && recipe.user_id !== user.id) {
+        await supabase.from('notifications').insert([{
+          user_id: recipe.user_id,
+          from_user_id: user.id,
+          type: 'rating',
+          reference_id: id
+        }]);
       }
-    } else {
-      // Like
-      const { error } = await supabase
-        .from('likes')
-        .insert([{ user_id: user.id, recipe_id: id }]);
-
-      if (!error) {
-        setIsLiked(true);
-        setLikeCount(prev => prev + 1);
-      }
+    } catch (error) {
+      console.error('Error saving rating:', error);
     }
   };
 
-  const handleSave = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
-
-    if (isSaved) {
-      // Unsave
-      const { error } = await supabase
-        .from('saved_recipes')
-        .delete()
-        .eq('user_id', user.id)
-        .eq('recipe_id', id);
-
-      if (!error) {
-        setIsSaved(false);
-      }
-    } else {
-      // Save
-      const { error } = await supabase
-        .from('saved_recipes')
-        .insert([{ user_id: user.id, recipe_id: id }]);
-
-      if (!error) {
-        setIsSaved(true);
-      }
-    }
-  };
-
-  const handleAddComment = async (e) => {
+  const handleCommentSubmit = async (e) => {
     e.preventDefault();
-    if (!newComment.trim() || !user) return;
-
-    const { error } = await supabase
-      .from('comments')
-      .insert([
-        { 
-          user_id: user.id, 
-          recipe_id: id, 
-          content: newComment.trim() 
-        }
-      ]);
-
-    if (!error) {
-      setNewComment('');
+    
+    if (!user) {
+      navigate('/login', { state: { from: `/recipe/${id}` } });
+      return;
     }
+    
+    if (!commentContent.trim()) return;
+    
+    try {
+      const { data, error } = await supabase
+        .from('comments')
+        .insert([
+          { 
+            content: commentContent,
+            recipe_id: id,
+            user_id: user.id,
+            parent_id: replyingTo?.commentId || null
+          }
+        ])
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Reset form
+      setCommentContent('');
+      setShowCommentForm(false);
+      setReplyingTo(null);
+      
+      // Re-fetch comments to update the list
+      fetchComments();
+      
+      // Create notification for recipe author if not the current user
+      if (recipe && recipe.user_id !== user.id && !replyingTo) {
+        await supabase.from('notifications').insert([{
+          user_id: recipe.user_id,
+          from_user_id: user.id,
+          type: 'comment',
+          reference_id: id
+        }]);
+      }
+      
+      // Create notification for the user being replied to if it's a reply
+      if (replyingTo && replyingTo.userId !== user.id) {
+        await supabase.from('notifications').insert([{
+          user_id: replyingTo.userId,
+          from_user_id: user.id,
+          type: 'comment_reply',
+          reference_id: replyingTo.commentId
+        }]);
+      }
+      
+    } catch (error) {
+      console.error('Error adding comment:', error);
+    }
+  };
+
+  const handleCommentLike = async (commentId, isLiked) => {
+    if (!user) {
+      navigate('/login', { state: { from: `/recipe/${id}` } });
+      return;
+    }
+    
+    try {
+      if (isLiked) {
+        // Unlike
+        const { error } = await supabase
+          .from('comment_likes')
+          .delete()
+          .eq('comment_id', commentId)
+          .eq('user_id', user.id);
+          
+        if (error) throw error;
+      } else {
+        // Like
+        const { error } = await supabase
+          .from('comment_likes')
+          .insert([{ comment_id: commentId, user_id: user.id }]);
+          
+        if (error) throw error;
+        
+        // Create notification for comment author if not the current user
+        const comment = findCommentById(comments, commentId);
+        if (comment && comment.user_id !== user.id) {
+          await supabase.from('notifications').insert([{
+            user_id: comment.user_id,
+            from_user_id: user.id,
+            type: 'comment_like',
+            reference_id: commentId
+          }]);
+        }
+      }
+      
+      // Update local state
+      const updateCommentLikes = (comments, targetId, increment) => {
+        return comments.map(comment => {
+          if (comment.id === targetId) {
+            return {
+              ...comment,
+              like_count: (comment.like_count || 0) + (increment ? 1 : -1)
+            };
+          }
+          
+          if (comment.replies && comment.replies.length > 0) {
+            return {
+              ...comment,
+              replies: updateCommentLikes(comment.replies, targetId, increment)
+            };
+          }
+          
+          return comment;
+        });
+      };
+      
+      setComments(prev => updateCommentLikes(prev, commentId, !isLiked));
+      
+    } catch (error) {
+      console.error('Error toggling comment like:', error);
+    }
+  };
+  
+  const findCommentById = (comments, commentId) => {
+    for (const comment of comments) {
+      if (comment.id === commentId) return comment;
+      if (comment.replies) {
+        const found = findCommentById(comment.replies, commentId);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  
+  const handleReply = (commentId, username, userId) => {
+    setReplyingTo({ commentId, username, userId });
+    setShowCommentForm(true);
+    
+    // Focus the comment input
+    setTimeout(() => {
+      if (commentInputRef.current) {
+        commentInputRef.current.focus();
+      }
+    }, 100);
+  };
+  
+  const handleDeleteComment = async (commentId) => {
+    if (!window.confirm('Are you sure you want to delete this comment?')) return;
+    
+    try {
+      const { error } = await supabase
+        .from('comments')
+        .delete()
+        .eq('id', commentId);
+        
+      if (error) throw error;
+      
+      // Remove the comment from the local state
+      const removeComment = (comments, targetId) => {
+        return comments.reduce((acc, comment) => {
+          if (comment.id === targetId) return acc;
+          
+          if (comment.replies && comment.replies.length > 0) {
+            return [...acc, {
+              ...comment,
+              replies: removeComment(comment.replies, targetId)
+            }];
+          }
+          
+          return [...acc, comment];
+        }, []);
+      };
+      
+      setComments(prev => removeComment(prev, commentId));
+      
+    } catch (error) {
+      console.error('Error deleting comment:', error);
+    }
+  };
+
+  useEffect(() => {
+    fetchRecipe();
+    fetchMedia();
+    checkIfLiked();
+    checkIfSaved();
+    fetchComments();
+    getCurrentUser();
+    
+    const commentsSubscription = supabase
+      .channel('comments')
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'comments',
+          filter: `recipe_id=eq.${id}`
+        }, 
+        (payload) => {
+          if (payload.eventType === 'INSERT' && !payload.new.parent_id) {
+            fetchComments();
+          } else if (payload.eventType === 'DELETE') {
+            const removeComment = (comments, targetId) => {
+              return comments.reduce((acc, comment) => {
+                if (comment.id === targetId) return acc;
+                
+                if (comment.replies && comment.replies.length > 0) {
+                  return [...acc, {
+                    ...comment,
+                    replies: removeComment(comment.replies, targetId)
+                  }];
+                }
+                
+                return [...acc, comment];
+              }, []);
+            };
+            
+            setComments(prev => removeComment(prev, payload.old.id));
+          }
+        }
+      )
+      .subscribe();
+      
+    const ratingsSubscription = supabase
+      .channel('ratings')
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'ratings',
+          filter: `recipe_id=eq.${id}`
+        },
+        () => {
+          fetchRecipe();
+        }
+      )
+      .subscribe();
+      
+    const commentLikesSubscription = supabase
+      .channel('comment_likes')
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'comment_likes',
+          filter: `comment_id=in.(${comments.map(c => `'${c.id}'`).join(',')})`
+        },
+        (payload) => {
+          const updateCommentLikes = (comments, targetId, increment) => {
+            return comments.map(comment => {
+              if (comment.id === targetId) {
+                return {
+                  ...comment,
+                  like_count: (comment.like_count || 0) + (increment ? 1 : -1)
+                };
+              }
+              
+              if (comment.replies && comment.replies.length > 0) {
+                return {
+                  ...comment,
+                  replies: updateCommentLikes(comment.replies, targetId, increment)
+                };
+              }
+              
+              return comment;
+            });
+          };
+          
+          if (payload.eventType === 'INSERT') {
+            setComments(prev => updateCommentLikes(prev, payload.new.comment_id, true));
+          } else if (payload.eventType === 'DELETE') {
+            setComments(prev => updateCommentLikes(prev, payload.old.comment_id, false));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      commentsSubscription.unsubscribe();
+      ratingsSubscription.unsubscribe();
+      commentLikesSubscription.unsubscribe();
+    };
+  }, [id, user?.id]);
+
+  const getCurrentUser = async () => {
+    const { data: { user: authUser } } = await supabase.auth.getUser();
+    setUser(authUser);
   };
 
   const nextImage = () => {
